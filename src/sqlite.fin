@@ -1,0 +1,495 @@
+// fin-sqlite — a SQLite binding for Fin.
+//
+// A thin, honest binding over the system libsqlite3 C API (via @define
+// externs). No SQL is re-implemented here: parsing, storage, transactions,
+// and indexing are all real SQLite. If libsqlite3 is missing at link time,
+// nothing here builds — that is a real dependency, not a hidden one.
+//
+// Build note: link with libsqlite3. The stock `cc` link does not add it,
+// so use a FIN_CC wrapper, e.g.:
+//   printf '#!/bin/sh\nexec cc "$@" /lib/x86_64-linux-gnu/libsqlite3.so.0\n' > fincc-sqlite
+//   FIN_CC=./fincc-sqlite finc -I src tests/test_sqlite.fin -o test_sqlite
+// On a machine with libsqlite3-dev installed, `-lsqlite3` works the same
+// way. The CI workflow shows the same wrapper pattern.
+//
+// Result codes (SQLite's, used as literals — library modules must not
+// declare `const`, it does not lower through imports in finc 0.4.0):
+//   0   OK / DONE for exec, bind, finalize, close
+//   100 ROW  — sqlite_step produced one more row
+//   101 DONE — sqlite_step finished, no more rows
+// Column types (sqlite_col_type): 1 INTEGER, 2 REAL, 3 TEXT, 4 BLOB, 5 NULL.
+//
+// Ownership (read this before freeing anything):
+//   - sqlite_col_text / sqlite_col_name / sqlite_errmsg return FRESH heap
+//     strings: the caller frees each one with strings::std.free_str.
+//     This is deliberate: a borrowed column pointer dies at the next
+//     step/finalize, and a borrowed errmsg dies at the next SQLite call,
+//     so the library clones and hands you ownership instead.
+//   - sqlite_col_text answers "" (heap, free it) for a NULL column, and
+//     truncates a BLOB at its first NUL byte. NULL-sensitive code uses
+//     sqlite_col_type / sqlite_col_is_null; BLOB values are out of scope
+//     for v0.1.0 (see README limitations).
+//   - sqlite_bind_text clones the value into the statement: the caller's
+//     string may be freed right after binding. The clones are freed by
+//     sqlite_finalize. A statement that is never finalized leaks them.
+//   - A Db or Stmt must not be used after sqlite_close / sqlite_finalize.
+//   - sqlite_open keeps the handle even when ok is false (SQLite's own
+//     rule: the handle carries the error). Read sqlite_errmsg, then still
+//     call sqlite_close — unless the handle is null (out of memory).
+//   - SqlTable cells and column names are heap strings owned by the
+//     table; sqlite_table_get returns BORROWED pointers (never free
+//     them). Free the whole table with sqlite_free_table.
+//   - NULL renders as "" in SqlTable cells. Exact NULL handling needs
+//     the prepared-statement API above, not the table helper.
+
+import { Collection } from collection::std;
+import { len, clone, free_str } from strings::std;
+import { number2str, number2str_float } from types::std;
+
+namespace fin {
+
+// --- C externs (private: only the wrappers below are public) ---
+
+#[llvm_name="sqlite3_open"]
+@define c_sqlite_open(path: string, db: &&void) <int>;
+
+#[llvm_name="sqlite3_close"]
+@define c_sqlite_close(db: &void) <int>;
+
+#[llvm_name="sqlite3_errmsg"]
+@define c_sqlite_errmsg(db: &void) <string>;
+
+#[llvm_name="sqlite3_exec"]
+@define c_sqlite_exec(db: &void, sql: string, cb: &void, arg: &void, errmsg: &&void) <int>;
+
+#[llvm_name="sqlite3_last_insert_rowid"]
+@define c_sqlite_last_rowid(db: &void) <long>;
+
+#[llvm_name="sqlite3_changes"]
+@define c_sqlite_changes(db: &void) <int>;
+
+#[llvm_name="sqlite3_prepare_v2"]
+@define c_sqlite_prepare(db: &void, sql: string, nbyte: int, stmt: &&void, tail: &&void) <int>;
+
+#[llvm_name="sqlite3_step"]
+@define c_sqlite_step(stmt: &void) <int>;
+
+#[llvm_name="sqlite3_reset"]
+@define c_sqlite_reset(stmt: &void) <int>;
+
+#[llvm_name="sqlite3_finalize"]
+@define c_sqlite_finalize(stmt: &void) <int>;
+
+#[llvm_name="sqlite3_bind_int"]
+@define c_sqlite_bind_int(stmt: &void, idx: int, v: int) <int>;
+
+#[llvm_name="sqlite3_bind_int64"]
+@define c_sqlite_bind_int64(stmt: &void, idx: int, v: long) <int>;
+
+#[llvm_name="sqlite3_bind_double"]
+@define c_sqlite_bind_double(stmt: &void, idx: int, v: double) <int>;
+
+#[llvm_name="sqlite3_bind_text"]
+@define c_sqlite_bind_text(stmt: &void, idx: int, v: string, n: int, dest: &void) <int>;
+
+#[llvm_name="sqlite3_bind_null"]
+@define c_sqlite_bind_null(stmt: &void, idx: int) <int>;
+
+#[llvm_name="sqlite3_column_count"]
+@define c_sqlite_colcount(stmt: &void) <int>;
+
+#[llvm_name="sqlite3_column_type"]
+@define c_sqlite_coltype(stmt: &void, col: int) <int>;
+
+#[llvm_name="sqlite3_column_int"]
+@define c_sqlite_colint(stmt: &void, col: int) <int>;
+
+#[llvm_name="sqlite3_column_int64"]
+@define c_sqlite_colint64(stmt: &void, col: int) <long>;
+
+#[llvm_name="sqlite3_column_double"]
+@define c_sqlite_coldbl(stmt: &void, col: int) <double>;
+
+#[llvm_name="sqlite3_column_text"]
+@define c_sqlite_coltext(stmt: &void, col: int) <string>;
+
+#[llvm_name="sqlite3_column_bytes"]
+@define c_sqlite_colbytes(stmt: &void, col: int) <int>;
+
+#[llvm_name="sqlite3_column_name"]
+@define c_sqlite_colname(stmt: &void, col: int) <string>;
+
+// --- Database handle ---
+
+#[export]
+pub struct Db {
+    pub:
+        // Opaque sqlite3* handle. Null only when opening ran out of memory.
+        handle <&void>,
+        // False when sqlite3_open itself failed. The handle is still valid
+        // (it carries the error) and must still be closed.
+        ok <bool>,
+}
+
+// Open a database file, or ":memory:" for a temporary in-memory database.
+// On failure ok is false; read sqlite_errmsg before closing.
+#[export]
+pub fun sqlite_open(path: string) <Db> {
+    let handle <&void> = null;
+    let rc <int> = c_sqlite_open(path, &handle);
+    if (rc == 0) {
+        return Db{handle: handle, ok: true};
+    }
+    return Db{handle: handle, ok: false};
+}
+
+// Close a database. Returns the SQLite result code (0 on success).
+// Do not use the Db afterwards.
+#[export]
+pub fun sqlite_close(db: &Db) <int> {
+    if (db.handle == null) {
+        return 0;
+    }
+    return c_sqlite_close(db.handle);
+}
+
+// Last error message for this database, as a FRESH heap string (free it).
+// Answers "" when the handle is null.
+#[export]
+pub fun sqlite_errmsg(db: &Db) <string> {
+    if (db.handle == null) {
+        return clone("");
+    }
+    return clone(c_sqlite_errmsg(db.handle));
+}
+
+// Run SQL that returns no rows (CREATE, INSERT, UPDATE, DELETE, BEGIN,
+// COMMIT, ...). Multiple statements in one string are fine. Returns the
+// SQLite result code (0 on success); on failure read sqlite_errmsg.
+#[export]
+pub fun sqlite_exec(db: &Db, sql: string) <int> {
+    if (db.handle == null) {
+        return 1;
+    }
+    return c_sqlite_exec(db.handle, sql, null, null, null);
+}
+
+// Row id of the most recent successful INSERT on this database.
+#[export]
+pub fun sqlite_last_rowid(db: &Db) <long> {
+    if (db.handle == null) {
+        return 0;
+    }
+    return c_sqlite_last_rowid(db.handle);
+}
+
+// Number of rows modified by the most recent INSERT, UPDATE, or DELETE.
+#[export]
+pub fun sqlite_changes(db: &Db) <int> {
+    if (db.handle == null) {
+        return 0;
+    }
+    return c_sqlite_changes(db.handle);
+}
+
+// --- Prepared statements ---
+
+#[export]
+pub struct Stmt {
+    pub:
+        // Opaque sqlite3_stmt* handle. Null when preparation failed.
+        handle <&void>,
+        // False when sqlite3_prepare_v2 failed. Read the database's
+        // sqlite_errmsg for the reason, then finalize anyway is NOT
+        // needed (nothing was allocated) — but calling sqlite_finalize
+        // on a failed Stmt is harmless: it returns 0.
+        ok <bool>,
+        // Heap clones of every value bound with sqlite_bind_text, kept
+        // alive because SQLite was told SQLITE_STATIC (null destructor).
+        // Freed by sqlite_finalize; never touch directly.
+        bound <&Collection<string>>,
+}
+
+// Prepare one SQL statement. Only the first statement in the string is
+// prepared; trailing text is ignored (SQLite's own rule).
+#[export]
+pub fun sqlite_prepare(db: &Db, sql: string) <Stmt> {
+    let st <&void> = null;
+    if (db.handle == null) {
+        return Stmt{handle: null, ok: false, bound: new Collection::<string>{}};
+    }
+    let rc <int> = c_sqlite_prepare(db.handle, sql, 0 - 1, &st, null);
+    if (rc == 0) {
+        return Stmt{handle: st, ok: true, bound: new Collection::<string>{}};
+    }
+    return Stmt{handle: null, ok: false, bound: new Collection::<string>{}};
+}
+
+// Advance to the next row: 100 ROW, 101 DONE, anything else is an error
+// (read sqlite_errmsg on the database). A statement with a null handle
+// answers -1 instead of touching SQLite.
+#[export]
+pub fun sqlite_step(stmt: &Stmt) <int> {
+    if (stmt.handle == null) {
+        return 0 - 1;
+    }
+    return c_sqlite_step(stmt.handle);
+}
+
+// Rewind a statement so it can be stepped again. Bindings are kept.
+#[export]
+pub fun sqlite_reset(stmt: &Stmt) <int> {
+    if (stmt.handle == null) {
+        return 0 - 1;
+    }
+    return c_sqlite_reset(stmt.handle);
+}
+
+// Destroy a statement and free every bound-text clone. Returns the
+// SQLite result code (0 on success). Do not use the Stmt afterwards.
+#[export]
+pub fun sqlite_finalize(stmt: &Stmt) <int> {
+    for (let i <int> = 0; i < stmt.bound.len(); i++) {
+        free_str(stmt.bound.get(i));
+    }
+    delete stmt.bound;
+    if (stmt.handle == null) {
+        return 0;
+    }
+    return c_sqlite_finalize(stmt.handle);
+}
+
+// --- Binding parameters (1-based, ? placeholders) ---
+
+#[export]
+pub fun sqlite_bind_int(stmt: &Stmt, idx: int, v: int) <int> {
+    if (stmt.handle == null) {
+        return 0 - 1;
+    }
+    return c_sqlite_bind_int(stmt.handle, idx, v);
+}
+
+#[export]
+pub fun sqlite_bind_int64(stmt: &Stmt, idx: int, v: long) <int> {
+    if (stmt.handle == null) {
+        return 0 - 1;
+    }
+    return c_sqlite_bind_int64(stmt.handle, idx, v);
+}
+
+#[export]
+pub fun sqlite_bind_double(stmt: &Stmt, idx: int, v: double) <int> {
+    if (stmt.handle == null) {
+        return 0 - 1;
+    }
+    return c_sqlite_bind_double(stmt.handle, idx, v);
+}
+
+// Bind text. The value is CLONED into the statement, so the caller's
+// string may be freed right after this call. Returns the SQLite code.
+#[export]
+pub fun sqlite_bind_text(stmt: &Stmt, idx: int, v: string) <int> {
+    if (stmt.handle == null) {
+        return 0 - 1;
+    }
+    let kept <string> = clone(v);
+    stmt.bound.push(kept);
+    return c_sqlite_bind_text(stmt.handle, idx, kept, len(kept), null);
+}
+
+#[export]
+pub fun sqlite_bind_null(stmt: &Stmt, idx: int) <int> {
+    if (stmt.handle == null) {
+        return 0 - 1;
+    }
+    return c_sqlite_bind_null(stmt.handle, idx);
+}
+
+// --- Reading columns (0-based) ---
+
+#[export]
+pub fun sqlite_col_count(stmt: &Stmt) <int> {
+    if (stmt.handle == null) {
+        return 0;
+    }
+    return c_sqlite_colcount(stmt.handle);
+}
+
+// 1 INTEGER, 2 REAL, 3 TEXT, 4 BLOB, 5 NULL. 0 for a null handle or an
+// out-of-range column (SQLite's own rule for the latter is undefined;
+// the library guards the handle, callers must keep col in range).
+#[export]
+pub fun sqlite_col_type(stmt: &Stmt, col: int) <int> {
+    if (stmt.handle == null) {
+        return 0;
+    }
+    return c_sqlite_coltype(stmt.handle, col);
+}
+
+#[export]
+pub fun sqlite_col_is_null(stmt: &Stmt, col: int) <bool> {
+    return sqlite_col_type(stmt, col) == 5;
+}
+
+#[export]
+pub fun sqlite_col_int(stmt: &Stmt, col: int) <int> {
+    if (stmt.handle == null) {
+        return 0;
+    }
+    return c_sqlite_colint(stmt.handle, col);
+}
+
+#[export]
+pub fun sqlite_col_int64(stmt: &Stmt, col: int) <long> {
+    if (stmt.handle == null) {
+        return 0;
+    }
+    return c_sqlite_colint64(stmt.handle, col);
+}
+
+#[export]
+pub fun sqlite_col_double(stmt: &Stmt, col: int) <double> {
+    if (stmt.handle == null) {
+        return 0;
+    }
+    return c_sqlite_coldbl(stmt.handle, col);
+}
+
+// Column value as a FRESH heap string (free it). NULL answers "" and a
+// BLOB is truncated at its first NUL byte — see the header note.
+#[export]
+pub fun sqlite_col_text(stmt: &Stmt, col: int) <string> {
+    if (stmt.handle == null) {
+        return clone("");
+    }
+    if (sqlite_col_type(stmt, col) == 5) {
+        return clone("");
+    }
+    return clone(c_sqlite_coltext(stmt.handle, col));
+}
+
+// Byte length of a column value (TEXT or BLOB), as SQLite reports it.
+#[export]
+pub fun sqlite_col_bytes(stmt: &Stmt, col: int) <int> {
+    if (stmt.handle == null) {
+        return 0;
+    }
+    return c_sqlite_colbytes(stmt.handle, col);
+}
+
+// Column name as a FRESH heap string (free it). "" for a null handle.
+#[export]
+pub fun sqlite_col_name(stmt: &Stmt, col: int) <string> {
+    if (stmt.handle == null) {
+        return clone("");
+    }
+    return clone(c_sqlite_colname(stmt.handle, col));
+}
+
+// --- Whole-query helper ---
+
+#[export]
+pub struct SqlTable {
+    pub:
+        // All cells, row-major. Row r starts at the sum of row_lens[0..r).
+        cells <&Collection<string>>,
+        // One field count per row, in order.
+        row_lens <&Collection<int>>,
+        // Column names, one per column of the result.
+        col_names <&Collection<string>>,
+        // Column count (0 when the query failed to prepare).
+        ncols <int>,
+        // False when preparation failed or a step errored. Rows already
+        // collected are still in the table; check ok before trusting it.
+        ok <bool>,
+}
+
+// Run a query and collect every row as text: INTEGER via %d, REAL via
+// %g, TEXT verbatim, NULL and BLOB as "". For exact types, NULL
+// detection, or int64 values past int32 range, use the prepared
+// statement API above instead — this helper trades precision for
+// convenience, and says so.
+#[export]
+pub fun sqlite_query_all(db: &Db, sql: string) <SqlTable> {
+    let t <SqlTable> = SqlTable{
+        cells: new Collection::<string>{},
+        row_lens: new Collection::<int>{},
+        col_names: new Collection::<string>{},
+        ncols: 0,
+        ok: true
+    };
+    let st <Stmt> = sqlite_prepare(db, sql);
+    if (!st.ok) {
+        t.ok = false;
+        sqlite_finalize(&st);
+        return t;
+    }
+    let n <int> = sqlite_col_count(&st);
+    t.ncols = n;
+    for (let c <int> = 0; c < n; c++) {
+        t.col_names.push(sqlite_col_name(&st, c));
+    }
+    while (true) {
+        let s <int> = sqlite_step(&st);
+        if (s == 100) {
+            for (let c <int> = 0; c < n; c++) {
+                let ty <int> = sqlite_col_type(&st, c);
+                if (ty == 1) {
+                    t.cells.push(number2str::<int>(sqlite_col_int(&st, c)));
+                } else {
+                    if (ty == 2) {
+                        t.cells.push(number2str_float::<double>(sqlite_col_double(&st, c)));
+                    } else {
+                        t.cells.push(sqlite_col_text(&st, c));
+                    }
+                }
+            }
+            t.row_lens.push(n);
+        } else {
+            if (s != 101) {
+                t.ok = false;
+            }
+            break;
+        }
+    }
+    sqlite_finalize(&st);
+    return t;
+}
+
+// Rows in the table.
+#[export]
+pub fun sqlite_table_rows(t: &SqlTable) <int> {
+    return t.row_lens.len();
+}
+
+// Cell value, BORROWED (never free it). "" out of range.
+#[export]
+pub fun sqlite_table_get(t: &SqlTable, row: int, col: int) <string> {
+    if (row < 0 || row >= t.row_lens.len()) {
+        return "";
+    }
+    if (col < 0 || col >= t.row_lens.get(row)) {
+        return "";
+    }
+    let start <int> = 0;
+    for (let r <int> = 0; r < row; r++) {
+        start = start + t.row_lens.get(r);
+    }
+    return t.cells.get(start + col);
+}
+
+// Free every cell, every column name, and all three collections.
+#[export]
+pub fun sqlite_free_table(t: &SqlTable) <noret> {
+    for (let i <int> = 0; i < t.cells.len(); i++) {
+        free_str(t.cells.get(i));
+    }
+    delete t.cells;
+    delete t.row_lens;
+    for (let i <int> = 0; i < t.col_names.len(); i++) {
+        free_str(t.col_names.get(i));
+    }
+    delete t.col_names;
+}
+
+}

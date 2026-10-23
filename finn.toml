@@ -1,0 +1,10 @@
+[project]
+name = "fin-sqlite"
+version = "0.1.0"
+envpath = ".finn"
+entrypoint = "sqlite.fin"
+
+[packages]
+
+[scripts]
+test = "FIN_CC=./fincc-sqlite finc -I src tests/test_sqlite.fin -o test_sqlite && ./test_sqlite"

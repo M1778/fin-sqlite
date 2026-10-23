@@ -1,0 +1,6 @@
+test_sqlite
+example_basic
+example_todo
+example_todos.db
+test_tmp_persist.db
+.finn/

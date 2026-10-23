@@ -1,0 +1,215 @@
+// Tests for fin-sqlite.
+// Run: FIN_CC=./fincc-sqlite finc -I src tests/test_sqlite.fin -o test_sqlite && ./test_sqlite
+// (fincc-sqlite wrapper lives in the repo root; see README "Building".)
+// Every assert_* blames (aborts, non-zero exit) on failure; a clean run
+// printing ALL TESTS PASSED means every check below passed.
+import { Db, Stmt, SqlTable,
+         sqlite_open, sqlite_close, sqlite_errmsg, sqlite_exec,
+         sqlite_last_rowid, sqlite_changes,
+         sqlite_prepare, sqlite_step, sqlite_reset, sqlite_finalize,
+         sqlite_bind_int, sqlite_bind_int64, sqlite_bind_double,
+         sqlite_bind_text, sqlite_bind_null,
+         sqlite_col_count, sqlite_col_type, sqlite_col_is_null,
+         sqlite_col_int, sqlite_col_int64, sqlite_col_double,
+         sqlite_col_text, sqlite_col_bytes, sqlite_col_name,
+         sqlite_query_all, sqlite_table_rows, sqlite_table_get,
+         sqlite_free_table } from sqlite::fin;
+import { assert_true, assert_false, assert_eq_int, assert_eq_long,
+         assert_eq_string } from testing::std;
+import { free_str, clone, len } from strings::std;
+import { file_exists, remove_file } from fs::std;
+
+fun test_open_exec() <noret> {
+    let db <Db> = sqlite_open(":memory:");
+    assert_true(db.ok, "open memory: ok");
+    let rc <int> = sqlite_exec(&db, "CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT, score REAL);");
+    assert_eq_int(rc, 0, "exec create: rc 0");
+    let rc2 <int> = sqlite_exec(&db, "INSERT INTO t(name, score) VALUES('ada', 9.5); INSERT INTO t(name, score) VALUES('grace', 8.25);");
+    assert_eq_int(rc2, 0, "exec multi-insert: rc 0");
+    assert_eq_long(sqlite_last_rowid(&db), 2, "last rowid: 2");
+    assert_eq_int(sqlite_changes(&db), 1, "changes: last insert touched 1 row");
+    let rc3 <int> = sqlite_exec(&db, "UPDATE t SET score = 10.0 WHERE name = 'ada';");
+    assert_eq_int(rc3, 0, "exec update: rc 0");
+    assert_eq_int(sqlite_changes(&db), 1, "changes: update touched 1 row");
+    assert_eq_int(sqlite_close(&db), 0, "close: rc 0");
+}
+
+fun test_query_all() <noret> {
+    let db <Db> = sqlite_open(":memory:");
+    assert_true(db.ok, "query: open ok");
+    assert_eq_int(sqlite_exec(&db, "CREATE TABLE t(id INTEGER, name TEXT, score REAL, note TEXT); INSERT INTO t VALUES(1, 'ada', 9.5, NULL); INSERT INTO t VALUES(2, 'grace', 8.25, 'hi');"), 0, "query: setup rc 0");
+    let t <SqlTable> = sqlite_query_all(&db, "SELECT id, name, score, note FROM t ORDER BY id");
+    assert_true(t.ok, "query: ok");
+    assert_eq_int(t.ncols, 4, "query: 4 cols");
+    assert_eq_int(sqlite_table_rows(&t), 2, "query: 2 rows");
+    assert_eq_string(sqlite_table_get(&t, 0, 1), "ada", "query: cell 0,1");
+    assert_eq_string(sqlite_table_get(&t, 1, 3), "hi", "query: cell 1,3");
+    // NULL renders as "" in the table helper (documented).
+    assert_eq_string(sqlite_table_get(&t, 0, 3), "", "query: null renders empty");
+    assert_eq_string(sqlite_table_get(&t, 0, 2), "9.5", "query: real renders %g");
+    assert_eq_string(sqlite_table_get(&t, 1, 0), "2", "query: int renders %d");
+    // Column names are owned by the table; borrowed reads here.
+    assert_eq_string(t.col_names.get(1), "name", "query: col name 1");
+    // Out of range answers "".
+    assert_eq_string(sqlite_table_get(&t, 9, 0), "", "query: row oob empty");
+    assert_eq_string(sqlite_table_get(&t, 0, 9), "", "query: col oob empty");
+    sqlite_free_table(&t);
+    // A failing query reports ok=false, not a blame.
+    let bad <SqlTable> = sqlite_query_all(&db, "SELECT * FROM no_such_table");
+    assert_false(bad.ok, "query: bad sql ok=false");
+    assert_eq_int(sqlite_table_rows(&bad), 0, "query: bad sql zero rows");
+    sqlite_free_table(&bad);
+    assert_eq_int(sqlite_close(&db), 0, "query: close rc 0");
+}
+
+fun test_prepared() <noret> {
+    let db <Db> = sqlite_open(":memory:");
+    assert_true(db.ok, "prep: open ok");
+    assert_eq_int(sqlite_exec(&db, "CREATE TABLE t(id INTEGER, name TEXT, score REAL, note TEXT); INSERT INTO t VALUES(1, 'ada', 9.5, NULL); INSERT INTO t VALUES(2, 'grace', 8.25, 'hi'); INSERT INTO t VALUES(3, 'lin', 7.0, '');"), 0, "prep: setup rc 0");
+    let st <Stmt> = sqlite_prepare(&db, "SELECT id, name, score, note FROM t WHERE id >= ? ORDER BY id");
+    assert_true(st.ok, "prep: prepare ok");
+    assert_eq_int(sqlite_bind_int(&st, 1, 2), 0, "prep: bind int rc 0");
+    assert_eq_int(sqlite_col_count(&st), 4, "prep: 4 cols");
+    let nm0 <string> = sqlite_col_name(&st, 1);
+    assert_eq_string(nm0, "name", "prep: col name 1");
+    free_str(nm0);
+    // Row 1: id=2 grace.
+    assert_eq_int(sqlite_step(&st), 100, "prep: step row 1");
+    assert_eq_int(sqlite_col_int(&st, 0), 2, "prep: col int");
+    assert_eq_int(sqlite_col_type(&st, 1), 3, "prep: name is TEXT");
+    let nm <string> = sqlite_col_text(&st, 1);
+    assert_eq_string(nm, "grace", "prep: col text");
+    free_str(nm);
+    assert_eq_int(sqlite_col_bytes(&st, 1), 5, "prep: col bytes");
+    // Row 2: id=3 lin, empty-string note (not NULL).
+    assert_eq_int(sqlite_step(&st), 100, "prep: step row 2");
+    assert_false(sqlite_col_is_null(&st, 3), "prep: empty string is not null");
+    assert_eq_int(sqlite_col_type(&st, 3), 3, "prep: empty string is TEXT");
+    let nt <string> = sqlite_col_text(&st, 3);
+    assert_eq_string(nt, "", "prep: empty string reads empty");
+    free_str(nt);
+    assert_eq_int(sqlite_step(&st), 101, "prep: step done");
+    // Reset and step again from the top.
+    assert_eq_int(sqlite_reset(&st), 0, "prep: reset rc 0");
+    assert_eq_int(sqlite_step(&st), 100, "prep: re-step row 1");
+    assert_eq_int(sqlite_col_int(&st, 0), 2, "prep: re-step id");
+    assert_eq_int(sqlite_finalize(&st), 0, "prep: finalize rc 0");
+    // NULL column through the exact API.
+    let st2 <Stmt> = sqlite_prepare(&db, "SELECT note FROM t WHERE id = 1");
+    assert_true(st2.ok, "prep: null prepare ok");
+    assert_eq_int(sqlite_step(&st2), 100, "prep: null step row");
+    assert_true(sqlite_col_is_null(&st2, 0), "prep: null column detected");
+    assert_eq_int(sqlite_col_type(&st2, 0), 5, "prep: null type 5");
+    let nt2 <string> = sqlite_col_text(&st2, 0);
+    assert_eq_string(nt2, "", "prep: null text renders empty");
+    free_str(nt2);
+    assert_eq_int(sqlite_finalize(&st2), 0, "prep: null finalize rc 0");
+    assert_eq_int(sqlite_close(&db), 0, "prep: close rc 0");
+}
+
+fun test_bind_types() <noret> {
+    let db <Db> = sqlite_open(":memory:");
+    assert_true(db.ok, "bind: open ok");
+    assert_eq_int(sqlite_exec(&db, "CREATE TABLE t(a INTEGER, b REAL, c TEXT, d TEXT);"), 0, "bind: setup rc 0");
+    // int64 past int32 range, built without a big literal.
+    let big <long> = cast<long>(50000) * cast<long>(100000);
+    let st <Stmt> = sqlite_prepare(&db, "INSERT INTO t VALUES(?, ?, ?, ?)");
+    assert_true(st.ok, "bind: insert prepare ok");
+    assert_eq_int(sqlite_bind_int64(&st, 1, big), 0, "bind: int64 rc 0");
+    assert_eq_int(sqlite_bind_double(&st, 2, cast<double>(2.5)), 0, "bind: double rc 0");
+    // Bound text is cloned: free the caller's copy right after binding
+    // and the stored value must survive (the clone lesson from xtest).
+    let heaptext <string> = clone("hello");
+    assert_eq_int(sqlite_bind_text(&st, 3, heaptext), 0, "bind: text rc 0");
+    free_str(heaptext);
+    assert_eq_int(sqlite_bind_null(&st, 4), 0, "bind: null rc 0");
+    assert_eq_int(sqlite_step(&st), 101, "bind: insert step done");
+    assert_eq_int(sqlite_finalize(&st), 0, "bind: insert finalize rc 0");
+    let rd <Stmt> = sqlite_prepare(&db, "SELECT a, b, c, d FROM t");
+    assert_true(rd.ok, "bind: read prepare ok");
+    assert_eq_int(sqlite_step(&rd), 100, "bind: read step row");
+    assert_eq_long(sqlite_col_int64(&rd, 0), big, "bind: int64 round-trips");
+    assert_eq_int(sqlite_col_type(&rd, 1), 2, "bind: real type 2");
+    let dbl <string> = sqlite_col_text(&rd, 1);
+    assert_eq_string(dbl, "2.5", "bind: real renders 2.5");
+    free_str(dbl);
+    let txt <string> = sqlite_col_text(&rd, 2);
+    assert_eq_string(txt, "hello", "bind: cloned text survived caller free");
+    free_str(txt);
+    assert_true(sqlite_col_is_null(&rd, 3), "bind: bound null reads null");
+    assert_eq_int(sqlite_finalize(&rd), 0, "bind: read finalize rc 0");
+    assert_eq_int(sqlite_close(&db), 0, "bind: close rc 0");
+}
+
+fun test_errors() <noret> {
+    let db <Db> = sqlite_open(":memory:");
+    assert_true(db.ok, "err: open ok");
+    // Bad prepare: ok=false, errmsg explains, step on it is guarded.
+    let bad <Stmt> = sqlite_prepare(&db, "SELEC oops");
+    assert_false(bad.ok, "err: bad prepare ok=false");
+    let msg <string> = sqlite_errmsg(&db);
+    assert_true(len(msg) > 0, "err: errmsg non-empty");
+    free_str(msg);
+    assert_eq_int(sqlite_step(&bad), 0 - 1, "err: step on failed stmt guarded");
+    assert_eq_int(sqlite_finalize(&bad), 0, "err: finalize failed stmt rc 0");
+    // Bad exec: non-zero rc, errmsg explains.
+    let rc <int> = sqlite_exec(&db, "INSERT INTO no_such_table VALUES(1);");
+    assert_true(rc != 0, "err: bad exec rc non-zero");
+    let msg2 <string> = sqlite_errmsg(&db);
+    assert_true(len(msg2) > 0, "err: exec errmsg non-empty");
+    free_str(msg2);
+    // Opening a path in a missing directory fails cleanly (no blame).
+    let bad2 <Db> = sqlite_open("/no_such_dir_xyz/db.sqlite");
+    assert_false(bad2.ok, "err: bad path ok=false");
+    let msg3 <string> = sqlite_errmsg(&bad2);
+    assert_true(len(msg3) > 0, "err: bad path errmsg non-empty");
+    free_str(msg3);
+    assert_eq_int(sqlite_close(&bad2), 0, "err: close failed db rc 0");
+    assert_eq_int(sqlite_close(&db), 0, "err: close rc 0");
+}
+
+fun test_file_persists() <noret> {
+    let path <string> = "test_tmp_persist.db";
+    if (file_exists(path)) {
+        remove_file(path);
+    }
+    let db <Db> = sqlite_open(path);
+    assert_true(db.ok, "file: open ok");
+    assert_eq_int(sqlite_exec(&db, "CREATE TABLE kv(k TEXT PRIMARY KEY, v TEXT); INSERT INTO kv VALUES('a', '1');"), 0, "file: setup rc 0");
+    assert_eq_int(sqlite_close(&db), 0, "file: close rc 0");
+    assert_true(file_exists(path), "file: db file exists after close");
+    let db2 <Db> = sqlite_open(path);
+    assert_true(db2.ok, "file: reopen ok");
+    let t <SqlTable> = sqlite_query_all(&db2, "SELECT v FROM kv WHERE k = 'a'");
+    assert_true(t.ok, "file: query ok");
+    assert_eq_int(sqlite_table_rows(&t), 1, "file: 1 row after reopen");
+    assert_eq_string(sqlite_table_get(&t, 0, 0), "1", "file: value survived reopen");
+    sqlite_free_table(&t);
+    assert_eq_int(sqlite_close(&db2), 0, "file: close2 rc 0");
+    assert_true(remove_file(path), "file: cleanup removed db");
+}
+
+fun test_transactions() <noret> {
+    let db <Db> = sqlite_open(":memory:");
+    assert_true(db.ok, "txn: open ok");
+    assert_eq_int(sqlite_exec(&db, "CREATE TABLE t(x INTEGER); BEGIN; INSERT INTO t VALUES(1); INSERT INTO t VALUES(2); COMMIT;"), 0, "txn: commit rc 0");
+    let t <SqlTable> = sqlite_query_all(&db, "SELECT COUNT(*) FROM t");
+    assert_eq_string(sqlite_table_get(&t, 0, 0), "2", "txn: 2 rows committed");
+    sqlite_free_table(&t);
+    assert_eq_int(sqlite_exec(&db, "BEGIN; INSERT INTO t VALUES(3); ROLLBACK;"), 0, "txn: rollback rc 0");
+    let t2 <SqlTable> = sqlite_query_all(&db, "SELECT COUNT(*) FROM t");
+    assert_eq_string(sqlite_table_get(&t2, 0, 0), "2", "txn: rollback kept 2 rows");
+    sqlite_free_table(&t2);
+    assert_eq_int(sqlite_close(&db), 0, "txn: close rc 0");
+}
+
+fun main() <noret> {
+    test_open_exec();
+    test_query_all();
+    test_prepared();
+    test_bind_types();
+    test_errors();
+    test_file_persists();
+    test_transactions();
+    printf("ALL TESTS PASSED\n");
+}

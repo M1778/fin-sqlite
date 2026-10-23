@@ -1,0 +1,5 @@
+// Export symbols from the main library file (rename to match src/sqlite.fin)
+// NOTE: `export *` is not valid Fin syntax (the Fin grammar has no export
+// keyword); finn's init template generates this file anyway. CI does NOT
+// run finc on this file.
+export * from "src/sqlite";

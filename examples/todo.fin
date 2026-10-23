@@ -1,0 +1,50 @@
+// Todo example: file-backed database + prepared statements with binds.
+// Run: FIN_CC=./fincc-sqlite finc -I src examples/todo.fin -o example_todo && ./example_todo
+// Then inspect the same file with the sqlite3 CLI:
+//   sqlite3 example_todos.db "SELECT id, title, done FROM todos ORDER BY id;"
+import { Db, Stmt, sqlite_open, sqlite_close, sqlite_exec,
+         sqlite_prepare, sqlite_step, sqlite_finalize,
+         sqlite_bind_int, sqlite_bind_text,
+         sqlite_col_int, sqlite_col_text } from sqlite::fin;
+import { free_str } from strings::std;
+import { file_exists, remove_file } from fs::std;
+
+fun main() <noret> {
+    let path <string> = "example_todos.db";
+    if (file_exists(path)) {
+        remove_file(path);
+    }
+    let db <Db> = sqlite_open(path);
+    if (!db.ok) {
+        printf("could not open db\n");
+        return;
+    }
+    sqlite_exec(&db, "CREATE TABLE todos(id INTEGER PRIMARY KEY, title TEXT, done INTEGER);");
+    // Insert with bound parameters.
+    let ins <Stmt> = sqlite_prepare(&db, "INSERT INTO todos(title, done) VALUES(?, ?)");
+    sqlite_bind_text(&ins, 1, "buy milk");
+    sqlite_bind_int(&ins, 2, 0);
+    sqlite_step(&ins);
+    sqlite_finalize(&ins);
+    let ins2 <Stmt> = sqlite_prepare(&db, "INSERT INTO todos(title, done) VALUES(?, ?)");
+    sqlite_bind_text(&ins2, 1, "read book");
+    sqlite_bind_int(&ins2, 2, 1);
+    sqlite_step(&ins2);
+    sqlite_finalize(&ins2);
+    // List unfinished todos.
+    let q <Stmt> = sqlite_prepare(&db, "SELECT id, title FROM todos WHERE done = ? ORDER BY id");
+    sqlite_bind_int(&q, 1, 0);
+    while (true) {
+        let s <int> = sqlite_step(&q);
+        if (s == 100) {
+            let title <string> = sqlite_col_text(&q, 1);
+            printf("todo %d: %s\n", sqlite_col_int(&q, 0), title);
+            free_str(title);
+        } else {
+            break;
+        }
+    }
+    sqlite_finalize(&q);
+    sqlite_close(&db);
+    printf("wrote %s (reopen it with the sqlite3 CLI to check)\n", path);
+}

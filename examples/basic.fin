@@ -1,0 +1,26 @@
+// Basic fin-sqlite example: in-memory database, exec + whole-query helper.
+// Run: FIN_CC=./fincc-sqlite finc -I src examples/basic.fin -o example_basic && ./example_basic
+import { Db, SqlTable, sqlite_open, sqlite_close, sqlite_exec,
+         sqlite_query_all, sqlite_table_rows, sqlite_table_get,
+         sqlite_free_table } from sqlite::fin;
+
+fun main() <noret> {
+    let db <Db> = sqlite_open(":memory:");
+    if (!db.ok) {
+        printf("could not open in-memory db\n");
+        return;
+    }
+    let rc <int> = sqlite_exec(&db, "CREATE TABLE greetings(lang TEXT, text TEXT); INSERT INTO greetings VALUES('en', 'hello'); INSERT INTO greetings VALUES('fa', 'salam');");
+    if (rc != 0) {
+        printf("setup failed\n");
+        sqlite_close(&db);
+        return;
+    }
+    let t <SqlTable> = sqlite_query_all(&db, "SELECT lang, text FROM greetings ORDER BY lang");
+    printf("rows: %d\n", sqlite_table_rows(&t));
+    for (let r <int> = 0; r < sqlite_table_rows(&t); r++) {
+        printf("%s: %s\n", sqlite_table_get(&t, r, 0), sqlite_table_get(&t, r, 1));
+    }
+    sqlite_free_table(&t);
+    sqlite_close(&db);
+}
